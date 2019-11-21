@@ -94,7 +94,7 @@ class Grid_Search:
                 if not param in ["input_shape"]:
                     print(" - {}: {}".format(param, candidate[param]))
         # load the best model (and remove it from disc)
-        model = utils.load_model(best_model_path)
+        model = utils.load_model(best_model_path, data.bluewhale)
         remove(best_model_path)
         remove("{}.h5".format(best_model_path))
         # save a formatted summary of all trained models

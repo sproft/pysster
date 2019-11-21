@@ -36,7 +36,7 @@ def save_model(model, file_path):
     model.model.save("{}.h5".format(file_path))
 
 
-def load_model(file_path):
+def load_model(file_path, bluewhale=False):
     """ Load a pysster.Model object.
 
     Parameters
@@ -51,14 +51,16 @@ def load_model(file_path):
     """
     from pysster.Model import Model
     from keras.models import load_model as load_keras
+    from janggu_layers import Reverse,Complement
     if not os.path.exists(file_path):
         raise RuntimeError("Path not found.")
     if not os.path.exists("{}.h5".format(file_path)):
         raise RuntimeError("HDF5 file not found.")
     with gzip.open(file_path, "rb") as handle:
         params = pickle.load(handle)
-    model = Model(params, None)
-    model.model = load_keras("{}.h5".format(file_path))
+    custom_objects={'Reverse':Reverse,'Complement':Complement}
+    model = Model(params, None, bluewhale=bluewhale)
+    model.model = load_keras("{}.h5".format(file_path),custom_objects=custom_objects)
     return model
 
 
@@ -230,28 +232,6 @@ def _predict_and_annotate(fasta_entry, predict_function):
     predict_entry = predict_function(fasta_entry)
     bg = fgb.BulgeGraph.from_dotbracket(predict_entry[2])
     return (predict_entry[0], predict_entry[1], bg.to_element_string().upper())
-
-
-def predict_structures_plfold(input_file, output_file):
-    handle_in = get_handle(input_file, "rt")
-    handle_out = get_handle(output_file, "wt")
-    for header, seq in parse_fasta(handle_in):
-        # get RNAplfold prediction. for the structure string every
-        # probability > 0.5 is considered paired ("P"), "U" == unpaired
-        call("echo {} | RNAplfold -o".format(seq), shell=True)
-        struct = len(seq) * ["U"]
-        with open("plfold_basepairs", "rt") as handle:
-            for line in handle:
-                line = line.split()
-                if float(line[2]) > 0.5:
-                    struct[int(line[0])-1] = "P"
-                    struct[int(line[1])-1] = "P"
-        struct = ''.join(struct)
-        handle_out.write(">{}\n{}\n{}\n".format(header, seq, struct))
-    handle_in.close()
-    handle_out.close()
-    os.remove("plfold_basepairs")
-
 
 
 def auROC(labels, predictions):

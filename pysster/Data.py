@@ -8,6 +8,7 @@ import pysster.utils as io
 from pysster.One_Hot_Encoder import One_Hot_Encoder
 from pysster.Alphabet_Encoder import Alphabet_Encoder
 
+from . import loaddata as Loader
 
 class Data:
     """
@@ -22,7 +23,7 @@ class Data:
     Additional handcrafted features may be added using the load_additional_data function.
     """
 
-    def __init__(self, class_files, alphabet, structure_pwm=False):
+    def __init__(self, class_files, alphabet, structure_pwm=False, zero_class=True, bluewhale=False):
         """ Load the sequences and split the data into 70%/15%/15% training/validation/test.
 
         If the goal is to do single-label classification a list of fasta files must be provided
@@ -83,6 +84,8 @@ class Data:
         """
         self.meta = OrderedDict()
         self.is_rna_pwm = False
+        self.bluewhale=bluewhale
+        self.zero_class=zero_class
         if isinstance(alphabet, tuple):
             self.is_rna = True
             self.is_rna_pwm = structure_pwm
@@ -97,6 +100,9 @@ class Data:
             self.multilabel = True
         else:
             self.multilabel = False
+        if self.bluewhale:
+            data_loader=self._load_bluewhale
+            self.multilabel = True
         self.one_hot_encoder = One_Hot_Encoder(alphabet)
         data_loader(class_files)
         # check if all sequences have the same length
@@ -128,12 +134,32 @@ class Data:
         """
         if seed:
             np.random.seed(seed)
-        num_sequences = len(self.data)
-        break_train = int(num_sequences * portion_train)
-        break_val = int(num_sequences * (portion_train + portion_val))
-        splits = np.random.permutation(np.arange(num_sequences))
-        splits = np.split(splits, [break_train, break_val])
-        self.splits = {"train": splits[0], "val": splits[1], "test": splits[2]}
+        if self.bluewhale:
+            if self.zero_class:
+                num_sequences = len(self.data[0])
+                #chr10+chr11
+                testsize=2702470+2672380
+                trainsize=51676736
+                self.splits = {"train": np.arange(testsize,trainsize), "val": np.arange(0,testsize), "test": np.arange(trainsize,num_sequences)}
+            else:
+                num_sequences = len(self.data[0])
+                #chr10+chr11
+                testsize=2702470+2672380
+                trainsize=51676736
+                train=np.arange(testsize,trainsize)
+                train=train[np.sum(self.labels[train],axis=1)>0]
+                val=np.arange(0,testsize)
+                val=val[np.sum(self.labels[val],axis=1)>0]
+                test=np.arange(trainsize,num_sequences)
+                test=test[np.sum(self.labels[test],axis=1)>0]
+                self.splits = {"train": train, "val": val, "test": test}
+        else:
+            num_sequences = len(self.data)
+            break_train = int(num_sequences * portion_train)
+            break_val = int(num_sequences * (portion_train + portion_val))
+            splits = np.random.permutation(np.arange(num_sequences))
+            splits = np.split(splits, [break_train, break_val])
+            self.splits = {"train": splits[0], "val": splits[1], "test": splits[2]}
 
 
     def load_additional_data(self, class_files, is_categorical=False, categories=None, standardize=False):
@@ -333,6 +359,54 @@ class Data:
         summary += "test:       {}".format(formatter(output["test"]))
         return summary
 
+    def _load_bluewhale(self,class_files):
+        self.data=[]
+
+        self.data.append(np.concatenate((self._loadDHS('train'),self._loadDHS('ladder'))))
+        self.data.append(np.concatenate((self._loadDNA('train'),self._loadDNA('ladder'))))
+        #self.data=np.asarray(self.data)
+        self.labels=np.concatenate((Loader.loadChipWithin(dataset='train'),Loader.loadChipWithin(dataset='ladder')))
+
+     #Load DHS-fold enrichment values
+    def _loadDHS(self,dataset,batchid=None):
+            nbins=9
+            nbatchsize=1000
+            #number of lines in annotations/cells.txt
+            ncell=13
+            #number of lines in extra/tfs_x_cells_within.txt
+            ntf=13
+            middledhs=Loader.loadDhsSum(batchid,dataset).astype("float16")
+            nrows=middledhs.shape[0]
+            dhsprofile=np.zeros((nrows,middledhs.shape[1],nbins),dtype="float16")
+    
+            #extract the enrichment for the neighboring bins
+            for i in range(int(nbins/2)):
+                dhsprofile[-(i*4-int(nbins/2)*4):,:,i]=middledhs[:(i*4-int(nbins/2)*4),:]
+                #dhsprofile[:(i*4-nbins/2*4),:,i]=middledhs[-(i*4-nbins/2*4):,:]
+                dhsprofile[:(i*4-int(nbins/2)*4),:,-(1+i)]=middledhs[-(i*4-int(nbins/2)*4):,:]
+            dhsprofile[:,:,int(nbins/2)]=middledhs
+    
+            return dhsprofile
+    
+    def _loadDNA(self,dataset,batchid=None):
+            dnamiddle=Loader.loadDna(batchid,dataset)
+            nrows=dnamiddle.shape[0]
+            print(dnamiddle.shape)
+    
+            dna=np.zeros((dnamiddle.shape[0],
+                dnamiddle.shape[1],dnamiddle.shape[2],
+                500),dtype=dnamiddle.dtype)
+    
+            dna[:,:,:,150:(150+dnamiddle.shape[3])]=dnamiddle
+            shape_=dnamiddle.shape[0]
+    
+            dna[4:,:,:,:150]=dnamiddle[:-4,:,:,50:]
+            dna[:-4,:,:,350:]=dnamiddle[4:,:,:,:150]
+    
+            dna = np.squeeze(np.einsum('bcol->blco',dna))
+    
+    
+            return dna
 
     def _load_encode_dna(self, class_files):
         self.data, self.labels = [], []
@@ -386,11 +460,14 @@ class Data:
 
 
     def _process_labels(self):
-        n_classes = max(max(entry) for entry in self.labels) + 1
-        for x in range(len(self.labels)):
-            label = np.zeros(n_classes, dtype=np.uint32)
-            label[self.labels[x]] = 1
-            self.labels[x] = label
+        if self.bluewhale:
+            print("no processing of labels neccessary")
+        else:
+            n_classes = max(max(entry) for entry in self.labels) + 1
+            for x in range(len(self.labels)):
+                label = np.zeros(n_classes, dtype=np.uint32)
+                label[self.labels[x]] = 1
+                self.labels[x] = label
 
 
     def _data_generator(self, group, batch_size, shuffle, labels=True, select=None, seed=None, meta=True):
@@ -410,6 +487,10 @@ class Data:
                     out_data = self._get_positionwise_data(idx, i, batch_size)
                     if meta == True and len(self.meta) > 0:
                         out_data = [out_data, self._get_additional_data(idx, i, batch_size)]
+                elif self.bluewhale:
+                    out_data=[]
+                    out_data.append(np.array([self.data[0][x] for x in idx[i:(i+batch_size)]]))
+                    out_data.append(np.array([self.data[1][x] for x in idx[i:(i+batch_size)]]))
                 else:
                     out_data = np.array([self.data[x] for x in idx[i:(i+batch_size)]])
                     if meta == True and len(self.meta) > 0:
@@ -427,6 +508,9 @@ class Data:
             if "positionwise" in dir(self) and len(self.positionwise) > 0:
                 for i in range(0, len(idx), batch_size):
                     yield self._get_positionwise_data(idx, i, batch_size)
+            elif self.bluewhale:
+                for i in range(0, len(idx), batch_size):
+                    yield np.array([self.data[1][x] for x in idx[i:(i+batch_size)]])
             else:
                 for i in range(0, len(idx), batch_size):
                     yield np.array([self.data[x] for x in idx[i:(i+batch_size)]])
@@ -457,7 +541,11 @@ class Data:
 
     def _get_data(self, group):
         idx = self._get_idx(group)
-        return np.array([self.data[x] for x in idx]), np.array([self.labels[x] for x in idx])
+        if self.bluewhale:
+            dat=[np.array([self.data[0][x] for x in idx]),np.array([self.data[1][x] for x in idx])]
+            return dat, np.array([self.labels[x] for x in idx])
+        else:
+            return np.array([self.data[x] for x in idx]), np.array([self.labels[x] for x in idx])
 
 
     def _get_idx(self, group):
@@ -470,12 +558,18 @@ class Data:
         # to be backward compatible
         if 'positionwise' in dir(self):
             return (self.data[0].shape[0], self.data[0].shape[1] + len(self.positionwise))
-        return self.data[0].shape
+        elif self.bluewhale:
+            return [self.data[0][0].shape, self.data[1][0].shape]
+        else:
+            return self.data[0].shape
 
 
     def _get_class_weights(self):
-        counts = sum(self.labels)
-        counts = float(len(self.labels)) / counts
+        counts = np.sum(self.labels, axis=0)
+        if self.zero_class:
+            counts = float(len(self.labels)) / counts
+        else:
+            counts = float(len(self.labels[np.sum(self.labels, axis=1)>0])) / counts
         counts = counts / counts.min()
         counts = {i: val for i, val in enumerate(counts)}
         if len(counts) == 2 and counts[0] == counts[1]:
@@ -492,10 +586,14 @@ class Data:
             select = range(len(idx))
         if True == self.is_rna_pwm:
             for x in select:
-                sequences.append(self.data[idx[x]])
+                sequences.append(self.data[1][idx[x]])
         else:
-            for x in select:
-                sequences.append(self.one_hot_encoder.decode(self.data[idx[x]]))
+            if self.bluewhale:
+                for x in select:
+                    sequences.append(self.one_hot_encoder.decode(self.data[1][idx[x]]))
+            else:
+                for x in select:
+                    sequences.append(self.one_hot_encoder.decode(self.data[idx[x]]))
         return sequences
 
 

@@ -22,6 +22,11 @@ import pysster.utils as utils
 from pysster.Motif import Motif
 
 
+#MY IMPORTS
+from janggu_layers import Reverse,Complement
+from keras.layers import Add, BatchNormalization, Activation, GlobalAveragePooling1D
+
+
 class Model:
     """
     The Model class represents a convolutional neural network and provides functions for
@@ -89,29 +94,14 @@ class Model:
     visualization will not be possible anymore if the first network layer is not a convolutional layer.
     """
 
-    def __init__(self, params, data, seed = None):
+    def __init__(self, params, data, seed = None, load=False, bluewhale=False):
         """ Initialize the model with the given parameters.
 
         Example: providing the params dict {'conv_num': 1, 'kernel_num': 20, 'dropout_input': 0.0}
-        will set these 3 parameters to the provided values. **All other parameters will 
-        have default values (see above)**. A data object must be provided to infer the input 
-        shape and number of classes.
+        will set these 3 parameters to the provided values. All other parameters will 
+        have default values. A data object must be provided to infer the input shape and
+        number of classes.
 
-        By default, multiple layers of the same type will share dependent parameters: 
-        {"dense_num": 3, "neuron_num": 100} creates a model with 100 neurons in each of the three
-        dense layers.
-        
-        To specify parameters for individual layers tuples must be provided:
-        {"dense_num": 3, "neuron_num": (300, 100, 30)} creates a model in which the first layer
-        has 300 neurons, the second 100 and the third 30.
-
-        Another example: the following model has two convolutional layers (the first layer
-        has 10 kernels of length 30, the second layer 20 kernels of length 3) and two dense
-        layers (first dense layer has 100 neurons, the second 10).
-        
-        '{"conv_num": 2, "kernel_num": (10, 20), "kernel_len": (30, 3),
-        '"dense_num": 2, "neuron_num": (100, 10)}
-        
         Parameters
         ----------
         params : dict
@@ -123,11 +113,15 @@ class Model:
         seed : int
             Seed for the random initialization of network weights.
         """
+        self.bluewhale=bluewhale
+        self.load=load
         self.params = deepcopy(params)
         if data != None:
+            self.bluewhale=data.bluewhale
             self.params["input_shape"] = data._shape()
             self.params["class_num"] = len(data.labels[0])
             if data.multilabel == True:
+                print("using multilabel data")
                 self.params["activation"] = "sigmoid"
                 self.params["loss"] = "binary_crossentropy"
             if len(data.meta) > 0:
@@ -149,13 +143,30 @@ class Model:
         if self.params["dense_num"] == 0 and len(data.meta) > 0:
             print("Warning: model doesn't have dense layers, the available additional data are not used!")
         self._prepare_callbacks()
-        self._prepare_model()
+        if self.load:
+            #self._load("/home/sproft/project/dream/NN/iNNvestigate/training/janggu_no_negatives_model.h5")
+            self._load(load)
+        else:
+            self._prepare_model()
 
 
     def print_summary(self):
         """ Print an overview of the network architecture.
         """
         self.model.summary()
+
+    def _load(self, file_name):
+        custom_objects={'Reverse':Reverse,'Complement':Complement}
+        self.model=load_model(file_name, custom_objects=custom_objects)
+        if("tivate" in self.model.layers[-1].name):
+             print("remove activation layer...")
+             self.model=KModel(inputs=self.model.inputs, outputs=self.model.layers[-2].output)
+             path = "{}/temp_model_file".format(gettempdir())
+             self.model.layers[-1].activation = keras.activations.sigmoid
+             self.model.save(path, overwrite = True)
+             K.clear_session()
+             self.model = load_model(path, custom_objects=custom_objects)
+             remove(path)
 
 
     def train(self, data, verbose = True):
@@ -172,6 +183,7 @@ class Model:
         verbose : bool
             If True, progress information (train/val loss) will be printed throughout the training. 
         """
+        custom_objects={'Reverse':Reverse,'Complement':Complement}
         np.random.seed(self.params["seed"])
         random.seed(self.params["seed"])
         n_train = len(data._get_idx('train'))
@@ -188,7 +200,7 @@ class Model:
                                                                         True, seed=self.params["seed"]),
                                  validation_steps = n_val,
                                  class_weight = data._get_class_weights())
-        self.model = load_model(self.temp_file)
+        self.model = load_model(self.temp_file, custom_objects=custom_objects)
         remove(self.temp_file)
 
 
@@ -242,13 +254,13 @@ class Model:
         results : dict
             A dict with 3 values ('activations', 'labels, 'group', see above)
         """
-        if not self.model.layers[2].name.startswith("conv1d") and \
-           not self.model.layers[0].name.startswith("dropout"):
+        if not "onv1d" in self.model.layers[4].name and \
+           not self.model[0].name.startswith("dropout"):
             raise RuntimeError("First layer is not a convolutional layer.")
         if self.model.layers[0].name.startswith("dropout"): # support models from pysster v1.0
-            tmp_model = KModel(self.model.input, self.model.layers[1].output)
+            tmp_model = KModel(self.model.input, self.model.layers[1].get_output_at(0))
         else:
-            tmp_model = KModel(self.model.input, self.model.layers[2].output)
+            tmp_model = KModel(self.model.input, self.model.layers[4].get_output_at(0))
         data_gen = data._data_generator(group, self.params['batch_size'], False, False)
         idx = data._get_idx(group)
         n = max(len(idx)//self.params['batch_size'] + (len(idx)%self.params['batch_size'] != 0), 1)
@@ -262,7 +274,7 @@ class Model:
 
 
     def visualize_kernel(self, activations, data, kernel, folder, colors_sequence={}, colors_structure={}):
-        """ Get a number of visualizations and an importance score for a convolutional kernel.
+        """ Get a number of visualizations and an importane score for a convolutional kernel.
 
         This function creates three (or four) output files: 1) a sequence(/structure) motif that the
         kernel has learned to detect, 2) a histogram/activation plot showing the 
@@ -328,7 +340,7 @@ class Model:
         results: (pysster.Motif, float) or ((pysster.Motif, pysster.Motif), float)
             A Motif object (or a tuple of Motifs for sequence/structure motifs) and the importance score.
         """
-        if not self.model.layers[2].name.startswith("conv1d") and \
+        if not "onv1d" in self.model.layers[4].name and \
            not self.model.layers[0].name.startswith("dropout"):
             raise RuntimeError("First layer is not a convolutional layer. Visualization not possible.")
         # this function is kind of messy to keep the memory usage low.
@@ -540,12 +552,13 @@ class Model:
         nodes : [int]
             List of integers indicating which nodes of the layer should be optimized (default: all).
         """
-        if len(self.inputs) > 1:
-            raise RuntimeError("Optimization not possible for a model with additional input.")
+        #if len(self.inputs) > 1:
+        #    raise RuntimeError("Optimization not possible for a model with additional input.")
         if 'positionwise' in dir(data) and len(data.positionwise) > 0:
             raise RuntimeError("Optimization currently not possible for a model with additional position-wise input.")
         if nodes == None:
             nodes = list(range(self.model.get_layer(layer_name).output_shape[-1]))
+#            nodes = nodes[:10]
         if layer_name == self.model.layers[-1].name:
             model = self._change_activation()
         else:
@@ -614,54 +627,141 @@ class Model:
         random.seed(self.params["seed"])
 
         # input
-        self.main_input = Input(shape = self.params["input_shape"])
+        if self.bluewhale:
+            self.main_input = Input(shape = self.params["input_shape"][1])
+        else:
+            self.main_input = Input(shape = self.params["input_shape"])
         self.cnn = Dropout(rate = self.params["dropout_input"])(self.main_input)
 
-        # convolutional/pooling block
-        for x in range(self.params["conv_num"]):
-            self.cnn = Conv1D(filters = self.params["kernel_num"][x],
-                              kernel_size = self.params["kernel_len"][x],
-                              padding = "valid",
-                              kernel_initializer = RandomUniform(),
-                              kernel_constraint = max_norm(self.params["kernel_constraint"]),
-                              activation = "relu")(self.cnn)
-            self.cnn = MaxPooling1D(pool_size = self.params["pool_size"][x],
-                                    strides = self.params["pool_stride"][x])(self.cnn)
-            self.cnn = Dropout(rate = self.params["dropout_conv"][x])(self.cnn)
+#        # convolutional/pooling block
+#        for x in range(self.params["conv_num"]):
+#            self.cnn = Conv1D(filters = self.params["kernel_num"][x],
+#                              kernel_size = self.params["kernel_len"][x],
+#                              padding = "valid",
+#                              kernel_initializer = RandomUniform(),
+#                              kernel_constraint = max_norm(self.params["kernel_constraint"]),
+#                              activation = "relu")(self.cnn)
+#            self.cnn = MaxPooling1D(pool_size = self.params["pool_size"][x],
+#                                    strides = self.params["pool_stride"][x])(self.cnn)
+#            self.cnn = Dropout(rate = self.params["dropout_conv"][x])(self.cnn)
+#
+#        # recurrent block
+#        if self.params["rnn_type"] != None:
+#            if self.params["rnn_type"] == "LSTM":
+#                rnn = LSTM
+#            elif self.params["rnn_type"] == "GRU":
+#                rnn = GRU
+#            else:
+#                raise ValueError("rnn_type '{}' not supported.".format(self.params["rnn_type"]))
+#            for x in range(self.params["rnn_num"]-1):
+#                self._add_rnn_layer(rnn, True, x)
+#            self._add_rnn_layer(rnn, False, self.params["rnn_num"]-1)
+#        else:
+#            self.cnn = Flatten()(self.cnn)
+#        
+#        # dense block
+#        for x in range(self.params["dense_num"]):
+#            # add additional input to the first dense layer if available
+#            if x == 0 and self.params["additional_input_length"] > 0:
+#                self.additional_input = Input(shape=(self.params["additional_input_length"],))
+#                self.additional_dropout = Dropout(rate = self.params["dropout_input"])(self.additional_input)
+#                self.cnn = concatenate([self.cnn, self.additional_dropout])
+#            self.cnn = Dense(units = self.params["neuron_num"][x],
+#                             kernel_initializer = RandomUniform(),
+#                             kernel_constraint = max_norm(self.params["kernel_constraint"]),
+#                             activation = "relu")(self.cnn)
+#            self.cnn = Dropout(rate = self.params["dropout_dense"][x])(self.cnn)
+#
 
-        # recurrent block
-        if self.params["rnn_type"] != None:
-            if self.params["rnn_type"] == "LSTM":
-                rnn = LSTM
-            elif self.params["rnn_type"] == "GRU":
-                rnn = GRU
-            else:
-                raise ValueError("rnn_type '{}' not supported.".format(self.params["rnn_type"]))
-            for x in range(self.params["rnn_num"]-1):
-                self._add_rnn_layer(rnn, True, x)
-            self._add_rnn_layer(rnn, False, self.params["rnn_num"]-1)
-        else:
-            self.cnn = Flatten()(self.cnn)
-        
-        # dense block
-        for x in range(self.params["dense_num"]):
-            # add additional input to the first dense layer if available
-            if x == 0 and self.params["additional_input_length"] > 0:
-                self.additional_input = Input(shape=(self.params["additional_input_length"],))
-                self.additional_dropout = Dropout(rate = self.params["dropout_input"])(self.additional_input)
-                self.cnn = concatenate([self.cnn, self.additional_dropout])
-            self.cnn = Dense(units = self.params["neuron_num"][x],
-                             kernel_initializer = RandomUniform(),
-                             kernel_constraint = max_norm(self.params["kernel_constraint"]),
-                             activation = "relu")(self.cnn)
-            self.cnn = Dropout(rate = self.params["dropout_dense"][x])(self.cnn)
+        conv1 = Conv1D(filters=self.params["kernel_num"][0],kernel_size=self.params["kernel_len"][0], activation="relu", name="conv1d_1",kernel_constraint=max_norm(self.params["kernel_constraint"]))
+
+        drop2 = Dropout(rate=0.3,name="Drop2")
+
+        maxPool = MaxPooling1D(pool_size=60,name="MaxPool")
+
+        conv2 = Conv1D(filters=self.params["kernel_num"][1], kernel_size=self.params["kernel_len"][1], name="conv1d_2", activation="relu",kernel_constraint=max_norm(self.params["kernel_constraint"]))
+
+        drop3 = Dropout(rate=0.3,name="Drop3")
+
+
+        networkf=conv1(self.cnn)
+        networkf=maxPool(networkf)
+        networkf=drop2(networkf)
+        networkf=conv2(networkf)
+        networkf=drop3(networkf)
+
+
+        revcomp=Reverse(name="Reverse1")(self.cnn)
+        revcomp=Complement(name="Complement")(revcomp)
+
+        networkr=conv1(revcomp)
+        networkr=maxPool(networkr)
+        networkr=drop2(networkr)
+        networkr=conv2(networkr)
+        networkr=drop3(networkr)
+
+
+        networkr = Reverse(name="Reverse2")(networkr)
+        network = Add(name="AddConv")([networkf, networkr])
+        self.cnn = GlobalAveragePooling1D(name='motif')(network)
+
+        topfeatures_dna=self.cnn
+
+        if self.bluewhale:
+            ###################Build DHS##################
+            dhs_in = Input(shape = self.params["input_shape"][0], dtype='float32', name='dhs_in')
+    
+            net = Flatten()(dhs_in)
+    
+            net = Dense(units=500, activation='relu', name="Dense1",use_bias=False)(net)
+    
+            net = BatchNormalization(name="Batch1")(net)
+    
+            net = Dense(units=600, activation='relu',name="Dense2",use_bias=False)(net)
+    
+            net = BatchNormalization(name="Batch2")(net)
+    
+            net = Dense(units=300, activation='relu',name="Dense3")(net)
+    
+            net = Dropout(0.6)(net)
+            
+            topfeatures_dhs=net
+           
+            ##############################################
+            nhidden=500
+    
+            # use top-hidden layer activities as input
+            # build on top of that two fully connected layers
+    
+            dna_net = Dense(units=nhidden, name="fromDNAsubnet",
+                    kernel_initializer='glorot_uniform',use_bias=False)(topfeatures_dna)
+    
+            dna_net = Dropout(0.6)(dna_net)
+    
+            dhs_net = Dense(units=nhidden, name="fromDHSsubnet",
+                    kernel_initializer='glorot_uniform')(topfeatures_dhs)
+    
+            dhs_net = Dropout(0.6)(dhs_net)
+    
+    
+            net=Add(name="AddInput")([dna_net, dhs_net])
+
+            net=Activation('relu')(net)
+    
+            net = Dense(units=200,name="DenseFull1",
+                    kernel_initializer='glorot_uniform')(net)
+    
+            self.cnn = Dropout(0.6)(net)
+    
 
         # output
-        self.cnn = Dense(units = self.params["class_num"],
+        self.cnn = Dense(units = self.params["class_num"], name="dense_out",
                          kernel_initializer = RandomUniform(),
                          activation = self.params['activation'])(self.cnn)
         if self.params["dense_num"] > 0 and self.params["additional_input_length"] > 0:
             self.inputs = [self.main_input, self.additional_input]
+        elif self.bluewhale:
+            self.inputs = [dhs_in, self.main_input]
         else:
             self.inputs = [self.main_input]
         self.model = KModel(inputs=self.inputs, outputs=[self.cnn])
@@ -715,7 +815,7 @@ class Model:
         else:
             layer_idx = 2
         get_out = K.function([self.model.layers[0].input, K.learning_phase()],
-                             [self.model.layers[layer_idx].output[:,:,kernel]])
+                             [self.model.layers[4].get_output_at(0)[:,:,kernel]])
         if '_data_gen_no_labels_meta' in dir(data):
             data_gen = data._data_gen_no_labels_meta(group, self.params['batch_size'], idx)
         else:
@@ -731,15 +831,33 @@ class Model:
 
 
     def _optimize_input(self, model, layer_name, node_index, input_data, lr, steps):
-        model_input = model.layers[0].input
-        loss = K.max(model.get_layer(layer_name).output[...,node_index])
-        grads = K.gradients(loss, model_input)[0]
-        grads = K.l2_normalize(grads, axis = 1)
-        iterate = K.function([model_input, K.learning_phase()], [loss, grads])
-        for _ in range(steps):
-            loss_value, grads_value = iterate([input_data, 0])
-            input_data += grads_value * lr
-        return input_data[0], loss_value > 2
+        if "ense" in layer_name and self.bluewhale == True:
+            model_input = model.inputs
+            loss = K.max(model.get_layer(layer_name).get_output_at(0)[...,node_index])
+            grads=[]
+            for i in range(len(model_input)):
+                tmp = K.gradients(loss, model_input[i])[0]
+                tmp = K.l2_normalize(tmp, axis = 1)
+                grads.append(tmp)
+            iterate = K.function([model_input[0],model_input[1], K.learning_phase()] , [loss, grads[0], grads[1]])
+            for _ in range(steps):
+                loss_value, grads_value, grads_value2 = iterate([input_data[0], input_data[1], 0])
+                grads_value=[grads_value, grads_value2]
+                for i in range(len(input_data)):
+                    input_data[i] += grads_value[i] * lr
+            return input_data[1][0], loss_value > 2
+
+        else:
+            model_input = model.layers[0].input
+            loss = K.max(model.get_layer(layer_name).get_output_at(0)[...,node_index])
+            grads = K.gradients(loss, model_input)[0]
+            grads = K.l2_normalize(grads, axis = 1)
+            iterate = K.function([model_input, K.learning_phase()], [loss, grads])
+            for _ in range(steps):
+                loss_value, grads_value = iterate([input_data, 0])
+                input_data += grads_value * lr
+            return input_data[0], loss_value > 2
+
 
 
     def _extract_pwm(self, input_data, annotation, alphabet):
@@ -752,8 +870,18 @@ class Model:
 
     def _get_optimized_input(self, model, data, layer_name, node_index, boundary, lr, steps, colors_sequence, colors_structure):
         for _attempt in range(5):
-            input_data = np.random.uniform(-boundary, +boundary,
-                                           (1, self.params["input_shape"][0], self.params["input_shape"][1]))
+            if self.bluewhale:
+                input_data=(np.random.uniform(-boundary, +boundary,
+                                               (1, self.params["input_shape"][1][0], self.params["input_shape"][1][1])))
+                if "ense" in layer_name:
+                    input_data = []
+                    input_data.append(np.random.uniform(-boundary, +boundary,
+                                               (1, self.params["input_shape"][0][0], self.params["input_shape"][0][1])))
+                    input_data.append(np.random.uniform(-boundary, +boundary,
+                                               (1, self.params["input_shape"][1][0], self.params["input_shape"][1][1])))
+            else:
+                input_data = np.random.uniform(-boundary, +boundary,
+                                               (1, self.params["input_shape"][0], self.params["input_shape"][1]))
             input_data, success = self._optimize_input(model, layer_name, node_index, input_data, lr, steps)
             if success: break
         if not success:
@@ -775,11 +903,13 @@ class Model:
 
 
     def _change_activation(self):
+        print("changing activation...")
+        custom_objects={'Reverse':Reverse,'Complement':Complement}
         path = "{}/temp_model_file".format(gettempdir())
         self.model.save(path, overwrite = True)
-        model = load_model(path)
+        model = load_model(path, custom_objects=custom_objects)
         model.layers[-1].activation = keras.activations.linear
         model.save(path, overwrite = True)
-        model = load_model(path)
+        model = load_model(path, custom_objects=custom_objects)
         remove(path)
         return model
